@@ -24,29 +24,30 @@ app.use(morgan('combined', {
 }));
 
 /* ── CORS ─────────────────────────────── */
+/* ── CORS ─────────────────────────────── */
 const allowedOrigins = [
   process.env.CLIENT_URL || 'http://localhost:5173',
   'http://localhost:5173',
   'http://localhost:3000',
   'https://mytherapy.minderytech.com',
+  'https://minderytech.com',
 ];
 
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests with no origin (Postman, curl) or matching origins
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS blocked for origin: ${origin}`));
+    if (!origin) return callback(null, true);
+    if (origin.endsWith('.minderytech.com') || allowedOrigins.includes(origin)) {
+      return callback(null, true);
     }
+    callback(new Error(`CORS blocked for origin: ${origin}`));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-}));
+};
 
-// Handle preflight for all routes
-app.options('*', cors());
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 /* ── Body parsing ─────────────────────── */
 app.use(express.json({ limit: '10mb' }));
