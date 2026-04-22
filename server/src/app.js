@@ -34,16 +34,25 @@ const allowedOrigins = [
 ];
 
 const corsOptions = {
-  origin: (origin, callback) => {
+  origin: function (origin, callback) {
+    // allow requests with no origin (like Postman, mobile apps)
     if (!origin) return callback(null, true);
-    if (origin.endsWith('.minderytech.com') || allowedOrigins.includes(origin)) {
-      return callback(null, true);
+
+    const allowed = [
+      'http://localhost:5173',
+      'http://localhost:3000',
+      'https://mytherapy.minderytech.com',
+      'https://minderytech.com'
+    ];
+
+    if (allowed.includes(origin) || origin.endsWith('.minderytech.com')) {
+      callback(null, true);
+    } else {
+      console.log("❌ Blocked CORS Origin:", origin);
+      callback(null, false); // ⚠️ IMPORTANT: don't throw error
     }
-    callback(new Error(`CORS blocked for origin: ${origin}`));
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
 };
 
 app.use(cors(corsOptions));
