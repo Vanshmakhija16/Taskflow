@@ -42,5 +42,5 @@ jobs:
         uses: azure/webapps-deploy@v3
         with:
           app-name: minderytaskflow-backend
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_382621898A8044C48D6297FCDF0A28EF }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
           package: .   # ✅ NOW this is correct (because artifact = server folder)
