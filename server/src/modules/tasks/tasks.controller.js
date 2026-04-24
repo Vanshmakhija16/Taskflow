@@ -13,19 +13,65 @@ const TASK_SELECT = `
 `.trim();
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   enrichTasks — resolves assignees, project, trainer details
+   Migration state cache — checked once at startup, cached for the process lifetime.
+   Avoids re-checking on every request.
 ───────────────────────────────────────────────────────────────────────────── */
-async function enrichTasks(tasks) {
+let _perAssigneeStatusMigrated = null; // null = not checked yet, true/false after first check
+
+async function hasPerAssigneeStatus() {
+  if (_perAssigneeStatusMigrated !== null) return _perAssigneeStatusMigrated;
+
+  try {
+    // Try to select the status column from task_assignees
+    const { error } = await supabaseAdmin
+      .from('task_assignees')
+      .select('status, completed_at, updated_at')
+      .limit(1);
+
+    if (error && (error.message.includes('column') || error.message.includes('does not exist'))) {
+      logger.warn('⚠️  task_assignees.status column missing. Per-assignee status not available.');
+      logger.warn('   Run the migration: migrations/2026_04_24_per_assignee_status.sql in Supabase SQL Editor.');
+      _perAssigneeStatusMigrated = false;
+    } else {
+      _perAssigneeStatusMigrated = true;
+    }
+  } catch (e) {
+    _perAssigneeStatusMigrated = false;
+  }
+
+  return _perAssigneeStatusMigrated;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   enrichTasks — resolves assignees, project, trainer details
+   viewerUserId: if provided, attaches my_status (this viewer's personal status)
+───────────────────────────────────────────────────────────────────────────── */
+async function enrichTasks(tasks, viewerUserId = null) {
   if (!tasks || tasks.length === 0) return [];
 
   const taskIds    = tasks.map(t => t.id).filter(Boolean);
   const projectIds = [...new Set(tasks.map(t => t.project_id).filter(Boolean))];
 
-  // Assignees via task_assignees
-  const assigneeMap = {};
+  const migrated = await hasPerAssigneeStatus();
+
+  // Assignees + their per-user statuses via task_assignees
+  const assigneeMap = {};   // taskId → [{ user, assignee_status, completed_at }]
+  const myStatusMap = {};   // taskId → { status, completed_at } for viewerUserId
+
   if (taskIds.length > 0) {
-    const { data: assigneeRows } = await supabaseAdmin
-      .from('task_assignees').select('task_id, user_id').in('task_id', taskIds);
+    // Select columns based on whether migration has been applied
+    const selectCols = migrated
+      ? 'task_id, user_id, status, completed_at, assigned_by, assigned_at'
+      : 'task_id, user_id, assigned_by, assigned_at';
+
+    const { data: assigneeRows, error: assigneeErr } = await supabaseAdmin
+      .from('task_assignees')
+      .select(selectCols)
+      .in('task_id', taskIds);
+
+    if (assigneeErr) {
+      logger.error('enrichTasks — task_assignees select error: ' + assigneeErr.message);
+    }
 
     const assigneeUserIds = [...new Set((assigneeRows || []).map(r => r.user_id).filter(Boolean))];
     const profileMap = {};
@@ -34,9 +80,23 @@ async function enrichTasks(tasks) {
         .from('profiles').select('id, full_name, email, avatar_url').in('id', assigneeUserIds);
       (profiles || []).forEach(p => { profileMap[p.id] = p; });
     }
+
     for (const row of (assigneeRows || [])) {
       if (!assigneeMap[row.task_id]) assigneeMap[row.task_id] = [];
-      if (profileMap[row.user_id]) assigneeMap[row.task_id].push(profileMap[row.user_id]);
+      if (profileMap[row.user_id]) {
+        assigneeMap[row.task_id].push({
+          ...profileMap[row.user_id],
+          assignee_status: migrated ? (row.status || 'pending') : null,
+          completed_at:    migrated ? (row.completed_at || null) : null,
+        });
+      }
+      // Track the viewer's personal status for this task
+      if (viewerUserId && row.user_id === viewerUserId && migrated) {
+        myStatusMap[row.task_id] = {
+          status:       row.status       || 'pending',
+          completed_at: row.completed_at || null,
+        };
+      }
     }
   }
 
@@ -78,6 +138,8 @@ async function enrichTasks(tasks) {
   return tasks.map(t => {
     const assignees       = assigneeMap[t.id] || [];
     const primaryAssignee = assignees[0] || null;
+    const myStatus        = myStatusMap[t.id] || null;
+
     return {
       ...t,
       assignees,
@@ -88,20 +150,123 @@ async function enrichTasks(tasks) {
       assignee_ids: assignees.map(a => a.id),
       reporter_id:  t.created_by ?? null,
       archived:     t.is_archived ?? false,
-      task_assignees:       assignees.map(a => ({ user_id: a.id, user: a })),
+      task_assignees: assignees.map(a => ({
+        user_id:      a.id,
+        user:         a,
+        status:       a.assignee_status ?? t.status, // fallback to global if migration not run
+        completed_at: a.completed_at,
+      })),
       task_trainer_details: trainerDetailsMap[t.id] ? [trainerDetailsMap[t.id]] : [],
       task_locations:       locationsMap[t.id] || [],
+      // my_status: viewer's personal status — falls back to global task status
+      my_status:       myStatus ? myStatus.status : t.status,
+      my_completed_at: myStatus ? myStatus.completed_at : null,
     };
   });
 }
 
 async function syncAssignees(taskId, assigneeIds, assignedBy) {
   const validIds = (assigneeIds || []).filter(Boolean);
+  const migrated = await hasPerAssigneeStatus();
+
+  // Get existing assignees to preserve their statuses
+  let existingMap = {};
+  if (migrated) {
+    const { data: existing } = await supabaseAdmin
+      .from('task_assignees').select('user_id, status, completed_at').eq('task_id', taskId);
+    (existing || []).forEach(r => { existingMap[r.user_id] = r; });
+  }
+
+  // Delete removed assignees
   await supabaseAdmin.from('task_assignees').delete().eq('task_id', taskId);
+
   if (validIds.length === 0) return;
-  await supabaseAdmin.from('task_assignees').insert(
-    validIds.map(userId => ({ task_id: taskId, user_id: userId, assigned_by: assignedBy || null }))
-  );
+
+  const rows = validIds.map(userId => {
+    const base = {
+      task_id:     taskId,
+      user_id:     userId,
+      assigned_by: assignedBy || null,
+    };
+    if (migrated) {
+      base.status       = existingMap[userId]?.status       || 'pending';
+      base.completed_at = existingMap[userId]?.completed_at || null;
+    }
+    return base;
+  });
+
+  const { error } = await supabaseAdmin.from('task_assignees').insert(rows);
+  if (error) logger.error('syncAssignees insert error: ' + error.message);
+}
+
+/* ── Update a single user's status for a task ── */
+async function setAssigneeStatus(taskId, userId, newStatus) {
+  const migrated = await hasPerAssigneeStatus();
+
+  if (!migrated) {
+    // Migration not applied — fall back to updating global task status directly
+    logger.warn(`setAssigneeStatus: migration not applied, updating global status instead (task ${taskId})`);
+    const { error } = await supabaseAdmin
+      .from('tasks')
+      .update({ status: newStatus, updated_at: new Date().toISOString() })
+      .eq('id', taskId);
+    if (error) throw new Error(error.message);
+    return newStatus;
+  }
+
+  // Check if user is an assignee — if not, insert them first
+  const { data: existing } = await supabaseAdmin
+    .from('task_assignees')
+    .select('user_id')
+    .eq('task_id', taskId)
+    .eq('user_id', userId)
+    .single();
+
+  if (!existing) {
+    // User is not in task_assignees yet (e.g. they created the task) — insert them
+    await supabaseAdmin.from('task_assignees').insert({
+      task_id:     taskId,
+      user_id:     userId,
+      assigned_by: userId,
+      status:      newStatus,
+      completed_at: newStatus === 'completed' ? new Date().toISOString() : null,
+    });
+  } else {
+    const updates = {
+      status:       newStatus,
+      updated_at:   new Date().toISOString(),
+      completed_at: newStatus === 'completed' ? new Date().toISOString() : null,
+    };
+    const { error } = await supabaseAdmin
+      .from('task_assignees')
+      .update(updates)
+      .eq('task_id', taskId)
+      .eq('user_id', userId);
+    if (error) throw new Error(error.message);
+  }
+
+  // Recalculate global task status:
+  // completed only if ALL assignees are completed
+  // blocked if any assignee is blocked
+  // working if any assignee is working
+  // pending otherwise
+  const { data: allRows } = await supabaseAdmin
+    .from('task_assignees').select('status').eq('task_id', taskId);
+
+  const statuses = (allRows || []).map(r => r.status);
+  let globalStatus = 'pending';
+  if (statuses.length > 0) {
+    if (statuses.every(s => s === 'completed'))   globalStatus = 'completed';
+    else if (statuses.some(s => s === 'blocked')) globalStatus = 'blocked';
+    else if (statuses.some(s => s === 'working')) globalStatus = 'working';
+    else                                           globalStatus = 'pending';
+  }
+
+  await supabaseAdmin.from('tasks')
+    .update({ status: globalStatus, updated_at: new Date().toISOString() })
+    .eq('id', taskId);
+
+  return globalStatus;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -174,7 +339,7 @@ async function getTasks(req, res) {
 
     const { data, error } = await query;
     if (error) return fail(res, error.message);
-    return res.json(await enrichTasks(data || []));
+    return res.json(await enrichTasks(data || [], req.user?.id));
   } catch (err) { return res.status(500).json({ error: err.message }); }
 }
 
@@ -193,7 +358,7 @@ async function getMyTasks(req, res) {
       .order('created_at', { ascending: false });
 
     if (error) return fail(res, error.message);
-    return res.json(await enrichTasks(data || []));
+    return res.json(await enrichTasks(data || [], req.user.id));
   } catch (err) { return res.status(500).json({ error: err.message }); }
 }
 
@@ -202,7 +367,6 @@ async function getAssignedByMe(req, res) {
   try {
     const uid = req.user.id;
 
-    // Tasks this user assigned to others (they appear in task_assignees with assigned_by = uid)
     const { data: taRows } = await supabaseAdmin
       .from('task_assignees').select('task_id, user_id')
       .eq('assigned_by', uid)
@@ -219,9 +383,8 @@ async function getAssignedByMe(req, res) {
       .order('created_at', { ascending: false });
 
     if (error) return fail(res, error.message);
-    const enriched = await enrichTasks(data || []);
+    const enriched = await enrichTasks(data || [], uid);
 
-    // Build by_user map
     const byUser = {};
     for (const row of taRows) {
       const task = enriched.find(t => t.id === row.task_id);
@@ -254,17 +417,15 @@ async function getUserTasks(req, res) {
       .order('created_at', { ascending: false });
 
     if (error) return fail(res, error.message);
-    const enriched = await enrichTasks(data || []);
+    const enriched = await enrichTasks(data || [], userId);
     return res.json({ data: enriched, meta: { total: enriched.length } });
   } catch (err) { return res.status(500).json({ error: err.message }); }
 }
 
-/* ── GET /tasks/calendar — supports optional user_id param ── */
+/* ── GET /tasks/calendar ── */
 async function getCalendar(req, res) {
   try {
     const { date_from, date_to, user_id } = req.query;
-
-    // Determine whose tasks to show: requested user_id or current user
     const uid = user_id || req.user.id;
     const taskIds = await getTaskIdsForUser(uid);
     if (taskIds.length === 0) return res.json([]);
@@ -278,7 +439,6 @@ async function getCalendar(req, res) {
       .order('due_date', { ascending: true });
 
     if (date_from && date_to) {
-      // Tasks that overlap the date range
       query = query
         .lte('start_date', date_to)
         .or(`due_date.gte.${date_from},due_date.is.null`);
@@ -286,7 +446,7 @@ async function getCalendar(req, res) {
 
     const { data, error } = await query;
     if (error) return fail(res, error.message);
-    return res.json(await enrichTasks(data || []));
+    return res.json(await enrichTasks(data || [], uid));
   } catch (err) {
     logger.error('getCalendar exception: ' + err.message);
     return res.status(500).json({ error: err.message });
@@ -302,7 +462,7 @@ async function getTask(req, res) {
       .from('tasks').select(TASK_SELECT)
       .eq('id', id).eq('is_deleted', false).single();
     if (error || !data) return fail(res, 'Task not found', 404);
-    const [enriched] = await enrichTasks([data]);
+    const [enriched] = await enrichTasks([data], req.user?.id);
     return res.json(enriched);
   } catch (err) { return res.status(500).json({ error: err.message }); }
 }
@@ -347,7 +507,6 @@ async function createTask(req, res) {
       .from('tasks').insert(payload).select(TASK_SELECT).single();
     if (error) return fail(res, error.message);
 
-    // Always add the creator as an assignee so the task appears on their board/calendar
     const finalAssignees = [...new Set([req.user.id, ...resolvedAssigneeIds])];
     await syncAssignees(data.id, finalAssignees, req.user.id);
 
@@ -355,7 +514,7 @@ async function createTask(req, res) {
       await syncTrainerData(data.id, trainer_details, locations);
     }
 
-    const [enriched] = await enrichTasks([data]);
+    const [enriched] = await enrichTasks([data], req.user.id);
     return res.status(201).json(enriched);
   } catch (err) {
     logger.error('createTask exception: ' + err.message);
@@ -370,11 +529,15 @@ async function updateTask(req, res) {
     if (!id || id === 'undefined') return fail(res, 'Invalid task id', 422);
 
     const updates = {};
-    const scalars = ['title','description','status','priority','category',
+    const scalars = ['title','description','priority','category',
                      'project_id','due_date','start_date','is_recurring',
                      'recurrence_type','board_position'];
     for (const key of scalars) {
       if (key in req.body) updates[key] = req.body[key] ?? null;
+    }
+
+    if ('status' in req.body) {
+      await setAssigneeStatus(id, req.user.id, req.body.status);
     }
 
     let newAssigneeIds = null;
@@ -403,9 +566,31 @@ async function updateTask(req, res) {
       await syncTrainerData(id, req.body.trainer_details, req.body.locations);
     }
 
-    const [enriched] = await enrichTasks([data]);
+    const [enriched] = await enrichTasks([data], req.user.id);
     return res.json(enriched);
   } catch (err) { return res.status(500).json({ error: err.message }); }
+}
+
+/* ── PATCH /tasks/:id/my-status — update only MY status for this task ── */
+async function updateMyStatus(req, res) {
+  try {
+    const { id } = req.params;
+    if (!id || id === 'undefined') return fail(res, 'Invalid task id', 422);
+    const { status } = req.body;
+    if (!status) return fail(res, 'status is required');
+
+    const globalStatus = await setAssigneeStatus(id, req.user.id, status);
+
+    const { data, error } = await supabaseAdmin
+      .from('tasks').select(TASK_SELECT).eq('id', id).single();
+    if (error) return fail(res, error.message);
+
+    const [enriched] = await enrichTasks([data], req.user.id);
+    return res.json({ ...enriched, global_status: globalStatus });
+  } catch (err) {
+    logger.error('updateMyStatus error: ' + err.message);
+    return res.status(500).json({ error: err.message });
+  }
 }
 
 /* ── PATCH /tasks/:id/status ── */
@@ -414,13 +599,18 @@ async function updateStatus(req, res) {
     const { id } = req.params;
     if (!id || id === 'undefined') return fail(res, 'Invalid task id', 422);
     const { status, board_position } = req.body;
+
+    if (status) {
+      await setAssigneeStatus(id, req.user.id, status);
+    }
+
     const updates = { updated_at: new Date().toISOString() };
-    if (status         != null) updates.status         = status;
     if (board_position != null) updates.board_position = board_position;
+
     const { data, error } = await supabaseAdmin
       .from('tasks').update(updates).eq('id', id).select(TASK_SELECT).single();
     if (error) return fail(res, error.message);
-    const [enriched] = await enrichTasks([data]);
+    const [enriched] = await enrichTasks([data], req.user.id);
     return res.json(enriched);
   } catch (err) { return res.status(500).json({ error: err.message }); }
 }
@@ -446,7 +636,7 @@ async function archiveTask(req, res) {
       .update({ is_archived: true, updated_at: new Date().toISOString() })
       .eq('id', id).select(TASK_SELECT).single();
     if (error) return fail(res, error.message);
-    const [enriched] = await enrichTasks([data]);
+    const [enriched] = await enrichTasks([data], req.user.id);
     return res.json(enriched);
   } catch (err) { return res.status(500).json({ error: err.message }); }
 }
@@ -456,11 +646,15 @@ async function reopenTask(req, res) {
   try {
     const { id } = req.params;
     if (!id || id === 'undefined') return fail(res, 'Invalid task id', 422);
-    const { data, error } = await supabaseAdmin.from('tasks')
-      .update({ status: 'pending', is_archived: false, updated_at: new Date().toISOString() })
+
+    await setAssigneeStatus(id, req.user.id, 'pending');
+
+    const { data, error } = await supabaseAdmin
+      .from('tasks')
+      .update({ is_archived: false, updated_at: new Date().toISOString() })
       .eq('id', id).select(TASK_SELECT).single();
     if (error) return fail(res, error.message);
-    const [enriched] = await enrichTasks([data]);
+    const [enriched] = await enrichTasks([data], req.user.id);
     return res.json(enriched);
   } catch (err) { return res.status(500).json({ error: err.message }); }
 }
@@ -477,11 +671,13 @@ async function bulkUpdate(req, res) {
       return res.json({ message: 'Tasks deleted', count: task_ids.length });
     }
     if (action === 'update_status' && payload.status) {
-      const { data, error } = await supabaseAdmin.from('tasks')
-        .update({ status: payload.status, updated_at: new Date().toISOString() })
-        .in('id', task_ids).select(TASK_SELECT);
+      for (const taskId of task_ids) {
+        await setAssigneeStatus(taskId, req.user.id, payload.status);
+      }
+      const { data, error } = await supabaseAdmin
+        .from('tasks').select(TASK_SELECT).in('id', task_ids);
       if (error) return fail(res, error.message);
-      return res.json(await enrichTasks(data || []));
+      return res.json(await enrichTasks(data || [], req.user.id));
     }
     return fail(res, 'Unknown action');
   } catch (err) { return res.status(500).json({ error: err.message }); }
@@ -508,7 +704,7 @@ async function updateLocationCounts(req, res) {
 module.exports = {
   getTasks, getMyTasks, getAssignedByMe, getUserTasks,
   getCalendar, getTask, getTaskActivity,
-  createTask, updateTask, updateStatus,
+  createTask, updateTask, updateMyStatus, updateStatus,
   deleteTask, archiveTask, reopenTask,
   bulkUpdate, assignToLocation, updateLocationCounts,
 };

@@ -11,6 +11,7 @@ const authRoutes          = require('./modules/auth/auth.routes');
 const tasksRoutes         = require('./modules/tasks/tasks.routes');
 const projectsRoutes      = require('./modules/projects/projects.routes');
 const usersRoutes         = require('./modules/users/users.routes');
+const adminRoutes         = require('./modules/users/admin.routes');
 const commentsRoutes      = require('./modules/comments/comments.routes');
 const notificationsRoutes = require('./modules/notifications/notifications.routes');
 
@@ -24,32 +25,20 @@ app.use(morgan('combined', {
 }));
 
 /* ── CORS ─────────────────────────────── */
-/* ── CORS ─────────────────────────────── */
-const allowedOrigins = [
-  process.env.CLIENT_URL || 'http://localhost:5173',
-  'http://localhost:5173',
-  'http://localhost:3000',
-  'https://mytherapy.minderytech.com',
-  'https://minderytech.com',
-];
-
 const corsOptions = {
   origin: function (origin, callback) {
-    // allow requests with no origin (like Postman, mobile apps)
     if (!origin) return callback(null, true);
-
     const allowed = [
       'http://localhost:5173',
       'http://localhost:3000',
       'https://mytherapy.minderytech.com',
       'https://minderytech.com'
     ];
-
     if (allowed.includes(origin) || origin.endsWith('.minderytech.com')) {
       callback(null, true);
     } else {
       console.log("❌ Blocked CORS Origin:", origin);
-      callback(null, false); // ⚠️ IMPORTANT: don't throw error
+      callback(null, false);
     }
   },
   credentials: true,
@@ -70,6 +59,7 @@ app.use('/api/auth',          authRoutes);
 app.use('/api/tasks',         tasksRoutes);
 app.use('/api/projects',      projectsRoutes);
 app.use('/api/users',         usersRoutes);
+app.use('/api/admin',         adminRoutes);
 app.use('/api/comments',      commentsRoutes);
 app.use('/api/notifications', notificationsRoutes);
 

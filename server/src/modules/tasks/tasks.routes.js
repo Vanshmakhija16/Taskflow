@@ -4,7 +4,7 @@ const { authenticate } = require('../../middleware/auth.middleware');
 const { validate }     = require('../../middleware/error.middleware');
 const {
   getTasks, getMyTasks, getAssignedByMe, getUserTasks,
-  getTask, createTask, updateTask, updateStatus,
+  getTask, createTask, updateTask, updateMyStatus, updateStatus,
   deleteTask, archiveTask, reopenTask, bulkUpdate, getTaskActivity,
   assignToLocation, updateLocationCounts, getCalendar,
 } = require('./tasks.controller');
@@ -108,6 +108,16 @@ router.patch('/:id',
   ],
   validate,
   updateTask
+);
+
+// ── Per-user status (only updates MY status for this task) ──────────────────
+router.patch('/:id/my-status',
+  [
+    param('id').isUUID(),
+    body('status').isIn(['pending','working','completed','blocked']),
+  ],
+  validate,
+  updateMyStatus
 );
 
 router.patch('/:id/status',

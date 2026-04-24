@@ -1,5 +1,21 @@
 const { supabaseAdmin } = require('../../config/supabase');
 
+/* ── Period helper ────────────────────────────────────────────────────────────
+   Returns an ISO string for the start of the given period.
+   Used to filter completed tasks by when they were last updated.
+───────────────────────────────────────────────────────────────────────────── */
+function periodStart(period) {
+  const now = new Date();
+  switch (period) {
+    case 'week':    { const d = new Date(now); d.setDate(d.getDate() - 7);   return d.toISOString(); }
+    case 'month':   { const d = new Date(now); d.setMonth(d.getMonth() - 1); return d.toISOString(); }
+    case '3month':  { const d = new Date(now); d.setMonth(d.getMonth() - 3); return d.toISOString(); }
+    case '6month':  { const d = new Date(now); d.setMonth(d.getMonth() - 6); return d.toISOString(); }
+    case 'year':    { const d = new Date(now); d.setFullYear(d.getFullYear() - 1); return d.toISOString(); }
+    default:        return null; // 'all' or unknown → no date filter
+  }
+}
+
 const getProjects = async (req, res, next) => {
   try {
     let query = supabaseAdmin
@@ -85,84 +101,114 @@ const removeMember = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-// ── Dashboard stats — scoped to tasks assigned to the current user ──────────
+/* ── Dashboard stats — scoped to tasks assigned to the current user ──────────
+   Supports ?period=week|month|3month|6month|year|all
+   - All counts (total, pending, working, blocked, overdue) are always ALL-TIME
+   - 'done' and 'done_in_period' are the period-filtered completed count
+───────────────────────────────────────────────────────────────────────────── */
 const getDashboardStats = async (req, res, next) => {
   try {
     const uid     = req.user.id;
     const isAdmin = req.user.role === 'admin';
+    const period  = req.query.period || 'all'; // week|month|3month|6month|year|all
 
-    let tasks = [];
+    // ── Fetch ALL assigned tasks (for totals, pending, working, blocked, overdue) ──
+    let allTasks = [];
 
     if (isAdmin) {
-      // Admin sees all non-recurring tasks
       const { data, error } = await supabaseAdmin
         .from('tasks')
-        .select('id, status, priority, due_date')
+        .select('id, status, priority, due_date, updated_at')
         .eq('is_deleted',   false)
         .eq('is_archived',  false)
         .eq('is_recurring', false);
       if (error) throw error;
-      tasks = data || [];
+      allTasks = data || [];
     } else {
-      // Regular user — get task IDs via task_assignees join table
       const { data: assigneeRows, error: aErr } = await supabaseAdmin
-        .from('task_assignees')
-        .select('task_id')
-        .eq('user_id', uid);
+        .from('task_assignees').select('task_id').eq('user_id', uid);
       if (aErr) throw aErr;
 
       const taskIds = (assigneeRows || []).map(r => r.task_id).filter(Boolean);
-
       if (taskIds.length === 0) {
-        return res.json({
-          total_tasks: 0, done: 0, in_progress: 0,
-          pending: 0, blocked: 0, overdue: 0,
-          by_status:   { pending: 0, working: 0, completed: 0, blocked: 0 },
-          by_priority: { low: 0, medium: 0, high: 0 },
-        });
+        return res.json(emptyStats(period));
       }
 
       const { data, error } = await supabaseAdmin
         .from('tasks')
-        .select('id, status, priority, due_date')
+        .select('id, status, priority, due_date, updated_at')
         .in('id', taskIds)
         .eq('is_deleted',   false)
         .eq('is_archived',  false)
         .eq('is_recurring', false);
       if (error) throw error;
-      tasks = data || [];
+      allTasks = data || [];
     }
-
-    const stats = {
-      total: tasks.length,
-      by_status:   { pending: 0, working: 0, completed: 0, blocked: 0 },
-      by_priority: { low: 0, medium: 0, high: 0 },
-      overdue: 0,
-    };
 
     const today = new Date();
     today.setHours(23, 59, 59, 999);
 
-    for (const t of tasks) {
-      if (stats.by_status[t.status] !== undefined)   stats.by_status[t.status]++;
-      if (stats.by_priority[t.priority] !== undefined) stats.by_priority[t.priority]++;
-      // Only overdue if due date has FULLY passed (not just today)
-      if (t.due_date && new Date(t.due_date) < today && t.status !== 'completed') {
-        stats.overdue++;
-      }
+    // All-time counts
+    let totalTasks = allTasks.length;
+    let pending = 0, working = 0, blocked = 0, completedAllTime = 0, overdue = 0;
+
+    for (const t of allTasks) {
+      if (t.status === 'pending')   pending++;
+      if (t.status === 'working')   working++;
+      if (t.status === 'blocked')   blocked++;
+      if (t.status === 'completed') completedAllTime++;
+      if (t.due_date && new Date(t.due_date) < today && t.status !== 'completed') overdue++;
     }
 
+    // Period-filtered: tasks completed within the selected period
+    const since = periodStart(period);
+    let doneInPeriod = completedAllTime; // default: 'all' = same as all-time
+
+    if (since) {
+      const sinceDate = new Date(since);
+      doneInPeriod = allTasks.filter(t =>
+        t.status === 'completed' &&
+        t.updated_at &&
+        new Date(t.updated_at) >= sinceDate
+      ).length;
+    }
+
+    const completionRate = totalTasks > 0 ? Math.round((completedAllTime / totalTasks) * 100) : 0;
+    const periodRate     = totalTasks > 0 ? Math.round((doneInPeriod    / totalTasks) * 100) : 0;
+
     res.json({
-      total_tasks: stats.total,
-      done:        stats.by_status.completed,
-      in_progress: stats.by_status.working,
-      pending:     stats.by_status.pending,
-      blocked:     stats.by_status.blocked,
-      overdue:     stats.overdue,
-      by_status:   stats.by_status,
-      by_priority: stats.by_priority,
+      period,
+      total_tasks:       totalTasks,
+      done:              completedAllTime,   // all-time completed
+      done_in_period:    doneInPeriod,       // completed within selected period
+      in_progress:       working,
+      pending,
+      blocked,
+      overdue,
+      completion_rate:   completionRate,     // all-time %
+      period_rate:       periodRate,         // % completed in period
+      by_status:   { pending, working, completed: completedAllTime, blocked },
+      by_priority: countByPriority(allTasks),
     });
   } catch (err) { next(err); }
 };
+
+function emptyStats(period = 'all') {
+  return {
+    period, total_tasks: 0, done: 0, done_in_period: 0,
+    in_progress: 0, pending: 0, blocked: 0, overdue: 0,
+    completion_rate: 0, period_rate: 0,
+    by_status:   { pending: 0, working: 0, completed: 0, blocked: 0 },
+    by_priority: { low: 0, medium: 0, high: 0 },
+  };
+}
+
+function countByPriority(tasks) {
+  const counts = { low: 0, medium: 0, high: 0 };
+  for (const t of tasks) {
+    if (counts[t.priority] !== undefined) counts[t.priority]++;
+  }
+  return counts;
+}
 
 module.exports = { getProjects, getProject, createProject, updateProject, deleteProject, addMember, removeMember, getDashboardStats };
